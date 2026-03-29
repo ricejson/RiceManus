@@ -1,29 +1,37 @@
-package agent
+package tool
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
+	"github.com/ricejson/rice-manus/agent"
+	"github.com/ricejson/rice-manus/models"
 )
 
 type ToolAgent struct {
-	ReActAgent
 	availableTools []tool.BaseTool
 	toolCallResp   *schema.Message
 }
 
+func NewToolAgent(availableTools []tool.BaseTool) *ToolAgent {
+	return &ToolAgent{
+		availableTools: availableTools,
+	}
+}
+
 // Think 思考是否执行工具调用
-func (agent *ToolAgent) Think() bool {
+func (agent *ToolAgent) Think(runtime *agent.AgentRuntime) (bool, error) {
 	ctx := context.Background()
 
 	// 1. 如果有 nextStepPrompt，添加到消息列表
-	if agent.nextStepPrompt != "" {
-		agent.messages = append(agent.messages, schema.UserMessage(agent.nextStepPrompt))
-		agent.nextStepPrompt = "" // 清空，避免重复添加
+	if runtime.NextStepPrompt != "" {
+		runtime.Messages = append(runtime.Messages, schema.UserMessage(runtime.NextStepPrompt))
+		runtime.NextStepPrompt = "" // 清空，避免重复添加
 	}
 
 	// 2. 准备工具信息
@@ -43,26 +51,22 @@ func (agent *ToolAgent) Think() bool {
 	}
 
 	// 4. 调用模型获取响应
-	resp, err := agent.chatModel.Generate(ctx, agent.messages, opts...)
+	resp, err := runtime.ChatModel.Generate(ctx, runtime.Messages, opts...)
 	if err != nil {
 		log.Printf("%s 的思考过程遇到了问题: %v", "ToolAgent", err)
-		agent.messages = append(agent.messages, schema.AssistantMessage(
+		runtime.Messages = append(runtime.Messages, schema.AssistantMessage(
 			fmt.Sprintf("处理时遇到错误: %v", err),
 			nil, // toolCalls
 		))
-		return false
+		return false, err
 	}
 
 	// 5. 获取模型输出
 	if resp == nil {
-		return false
+		return false, errors.New("模型返回为空")
 	}
 
 	agent.toolCallResp = resp
-
-	// 获取文本回复
-	textContent := resp.Content
-	log.Printf("%s 的思考: %s", "ToolAgent", textContent)
 
 	// 获取工具调用列表
 	toolCalls := resp.ToolCalls
@@ -74,17 +78,16 @@ func (agent *ToolAgent) Think() bool {
 	}
 
 	// 6. 根据是否有工具调用决定是否执行 Act
+	// 无论是否有 tool_calls，都需要把 assistant 消息加入历史
+	runtime.Messages = append(runtime.Messages, resp)
 	if len(toolCalls) == 0 {
-		// 只有不调用工具时，才记录助手消息
-		agent.messages = append(agent.messages, resp)
-		return false
-	} else {
-		return true
+		return false, nil
 	}
+	return true, nil
 }
 
 // Act 执行工具调用
-func (agent *ToolAgent) Act() (string, error) {
+func (agent *ToolAgent) Act(runtime *agent.AgentRuntime) (string, error) {
 	ctx := context.Background()
 
 	if agent.toolCallResp == nil || len(agent.toolCallResp.ToolCalls) == 0 {
@@ -142,8 +145,14 @@ func (agent *ToolAgent) Act() (string, error) {
 			ToolCallID: tc.ID,
 			ToolName:   toolName,
 		}
-		agent.messages = append(agent.messages, toolResult)
+		runtime.Messages = append(runtime.Messages, toolResult)
 		results = append(results, result)
+		// 判断是否调用了终止工具
+		if toolName == "terminate" {
+			// 修改任务状态
+			runtime.AgentState = models.AgentStateFinished
+			break
+		}
 	}
 
 	return fmt.Sprintf("工具调用完成: %s", results), nil
